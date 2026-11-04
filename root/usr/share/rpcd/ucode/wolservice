@@ -1,0 +1,1664 @@
+#!/usr/bin/ucode
+// SPDX-License-Identifier: MIT
+//
+// luci-app-wolservice —— rpcd ucode 插件
+//
+// 职责：UCI 设置、procd 状态、日志、配置校验/保存、二进制上传/安装/回滚。
+// 安全要点：
+//   * 主配置只读取/写入 YAML；凭据在加密 secrets 文件中，本插件不读取其内容。
+//   * 日志返回前对 password/token/secret 等键值做脱敏。
+//   * 所有外部命令参数都经过路径/字符白名单与 shell 单引号转义。
+//   * 二进制先写入临时文件并执行 -version 验证，成功后原子替换；失败自动回滚。
+
+'use strict';
+
+import { popen, readfile, writefile, open, stat, access, unlink, chmod } from 'fs';
+import { cursor } from 'uci';
+
+const CONF = 'wolservice';
+const BIN = '/usr/bin/wol';
+const PREV = '/usr/bin/wol.prev';
+const NEW_BIN = '/usr/bin/.wol.new';
+const LOG_FILE = '/tmp/log/wolservice.log';
+const DEFAULT_CONFIG = '/etc/wol/wol.yaml';
+const TMP_UPLOAD = '/tmp/wolservice.upload';
+const TMP_UMETA = '/tmp/wolservice.upload.meta';
+const JOB_SCRIPT = '/usr/libexec/wolservice/install-job.sh';
+const JOB_STATUS = '/tmp/wolservice.install.status';
+const JOB_DOWNLOAD = '/tmp/wolservice.download';
+const GH_API = 'https://api.github.com/repos/inxen/wolservice/releases/latest';
+const GH_DL_PREFIX = 'https://github.com/inxen/wolservice/releases/download/';
+const MIN_BINARY = 1024 * 1024;
+const MAX_BINARY = 128 * 1024 * 1024;
+const MAX_CONFIG = 512 * 1024;
+
+/* ---------------- 基础工具 ---------------- */
+
+function fail(msg) {
+	return { ok: false, error: `${msg}` };
+}
+
+function sq(s) {
+	return `'${replace(`${s}`, /'/g, `'\\''`)}'`;
+}
+
+function trim2(s) {
+	return s == null ? '' : replace(`${s}`, /^[ \t\r\n]+|[ \t\r\n]+$/g, '');
+}
+
+function shell(cmd) {
+	let p = popen(`${cmd}; echo "__RC__=$?"`);
+	if (!p)
+		return { rc: -1, out: '' };
+	let out = p.read('all') ?? '';
+	p.close();
+	let m = match(out, /__RC__=(-?\d+)\s*$/);
+	let rc = m ? +m[1] : -1;
+	if (m)
+		out = replace(out, /__RC__=-?\d+\s*$/, '');
+	return { rc, out };
+}
+
+function exists(path) {
+	return access(path) ? true : false;
+}
+
+function spawn(cmd) {
+	let p = popen(cmd);
+	if (!p)
+		return false;
+	p.read('all');
+	p.close();
+	return true;
+}
+
+function fsize(path) {
+	try {
+		let s = stat(path);
+		return s ? s.size : -1;
+	} catch (e) {
+		return -1;
+	}
+}
+
+function fmtime(path) {
+	try {
+		let s = stat(path);
+		return s ? (s.mtime ?? null) : null;
+	} catch (e) {
+		return null;
+	}
+}
+
+function lastLine(text) {
+	let lines = split(text ?? '', '\n');
+	for (let i = length(lines) - 1; i >= 0; i--)
+		if (trim2(lines[i]) != '')
+			return lines[i];
+	return '';
+}
+
+function readJson(path) {
+	try {
+		let raw = readfile(path);
+		return raw ? json(raw) : null;
+	} catch (e) {
+		return null;
+	}
+}
+
+function dirOf(p) {
+	let idx = -1;
+	for (let i = 0; i < length(p); i++)
+		if (substr(p, i, 1) == '/')
+			idx = i;
+	return idx > 0 ? substr(p, 0, idx) : '/';
+}
+
+function baseNoExt(p) {
+	let slash = -1, dot = -1;
+	for (let i = 0; i < length(p); i++) {
+		let ch = substr(p, i, 1);
+		if (ch == '/')
+			slash = i;
+		else if (ch == '.')
+			dot = i;
+	}
+	return dot > slash ? substr(p, 0, dot) : p;
+}
+
+function secretsPath(configPath) {
+	return baseNoExt(configPath) + '.secrets.yaml';
+}
+
+function secretsKeyPath(secrets) {
+	return baseNoExt(secrets) + '.key';
+}
+
+function truthy(v) {
+	return v === true || `${v}` == '1' || `${v}` == 'true';
+}
+
+/* ---------------- 配置与路径 ---------------- */
+
+function clampLog(v) {
+	let n = +v;
+	if (!(n >= 32))
+		n = 256;
+	if (n > 8192)
+		n = 8192;
+	return n;
+}
+
+function validConfigPath(p) {
+	if (p == null || p == '' || length(p) > 200)
+		return false;
+	if (match(p, /^\/[A-Za-z0-9._\/-]+$/) == null)
+		return false;
+	if (match(p, /\.\./) != null)
+		return false;
+	if (match(p, /\.(yaml|yml)$/) == null)
+		return false;
+	return true;
+}
+
+function validBinPath(p) {
+	return match(p ?? '', /^\/tmp\/[A-Za-z0-9._-]+$/) != null;
+}
+
+function conf() {
+	let u = cursor();
+	let g = function(k) { return u.get(CONF, 'main', k); };
+	let cp = trim2(g('config_path') ?? '') || DEFAULT_CONFIG;
+	if (!validConfigPath(cp))
+		cp = DEFAULT_CONFIG;
+	return {
+		enabled: g('enabled') == '1',
+		config_path: cp,
+		log_max_size: clampLog(g('log_max_size'))
+	};
+}
+
+function setUciEnabled(v) {
+	let u = cursor();
+	u.set(CONF, 'main', 'enabled', v ? '1' : '0');
+	u.commit(CONF);
+	chmod(`/etc/config/${CONF}`, 0o600);
+}
+
+/* 只做 YAML 顶层字段的轻量解析：listen/title/tls/config_panel。 */
+function parseConfig(text) {
+	let out = {
+		listen: '',
+		title: '',
+		tls: false,
+		tls_cert: '',
+		tls_key: '',
+		read_timeout: '15s',
+		shutdown_timeout: '15s',
+		panel: false,
+		log_level: 'info',
+		log_format: 'text'
+	};
+	let section = '';
+	let lines = split(text ?? '', '\n');
+	for (let i = 0; i < length(lines); i++) {
+		let line = lines[i];
+		if (trim2(line) == '' || match(line, /^[ \t]*#/) != null)
+			continue;
+		let top = match(line, /^([A-Za-z_][A-Za-z0-9_]*):[ \t]*(.*)$/);
+		if (top != null) {
+			section = top[1];
+			continue;
+		}
+		let kv = match(line, /^[ \t]+([A-Za-z_][A-Za-z0-9_]*):[ \t]*(.*)$/);
+		if (kv == null)
+			continue;
+		let key = kv[1];
+		let val = replace(kv[2], /[ \t]+#.*$/, '');
+		val = replace(val, /^["']/, '');
+		val = replace(val, /["'][ \t]*$/, '');
+		if (section == 'server') {
+			if (key == 'listen')
+				out.listen = trim2(val);
+			else if (key == 'title')
+				out.title = val;
+			else if (key == 'tls_cert') {
+				out.tls_cert = trim2(val);
+				out.tls = out.tls_cert != '';
+			}
+			else if (key == 'tls_key')
+				out.tls_key = trim2(val);
+			else if (key == 'read_timeout' && trim2(val) != '')
+				out.read_timeout = trim2(val);
+			else if (key == 'shutdown_timeout' && trim2(val) != '')
+				out.shutdown_timeout = trim2(val);
+		}
+		else if (section == 'config_panel' && key == 'enabled') {
+			out.panel = (val == 'true' || val == 'yes' || val == '1');
+		}
+		else if (section == 'log') {
+			if (key == 'level' && trim2(val) != '')
+				out.log_level = trim2(val);
+			else if (key == 'format' && trim2(val) != '')
+				out.log_format = trim2(val);
+		}
+	}
+	return out;
+}
+
+function splitListen(listen) {
+	let l = trim2(listen);
+	if (l == '')
+		return null;
+	let m = match(l, /^([0-9]+)$/);
+	if (m != null) {
+		let p = +m[1];
+		return (p > 0 && p < 65536) ? { host: '', port: p } : null;
+	}
+	m = match(l, /^\[([^\]]*)\]:([0-9]+)$/);
+	if (m != null) {
+		let p = +m[2];
+		return (p > 0 && p < 65536) ? { host: m[1], port: p } : null;
+	}
+	m = match(l, /^([^:]*):([0-9]+)$/);
+	if (m != null) {
+		let p = +m[2];
+		return (p > 0 && p < 65536) ? { host: trim2(m[1]), port: p } : null;
+	}
+	return null;
+}
+
+function hasLegacySecrets(text) {
+	let lines = split(text ?? '', '\n');
+	for (let i = 0; i < length(lines); i++) {
+		if (match(lines[i], /^[ \t]*(access_token|password|token|secret_key|auth_key|private_key|passphrase)[ \t]*:[ \t]*[^ \t#]+/) != null)
+			return true;
+	}
+	return false;
+}
+
+/* ---------------- 运行时状态 ---------------- */
+
+function serviceState() {
+	let r = shell(`ubus call service list '{"name":"wolservice"}'`);
+	if (r.rc != 0)
+		return { running: false, pid: null };
+	let j = null;
+	try { j = json(r.out); } catch (e) { j = null; }
+	let svc = j ? j['wolservice'] : null;
+	if (svc && svc.instances) {
+		let main = svc.instances['main'];
+		if (main)
+			return { running: main.running === true, pid: main.pid ?? null };
+		let first = null;
+		for (let k in svc.instances) {
+			let inst = svc.instances[k];
+			let cur = { running: inst.running === true, pid: inst.pid ?? null };
+			if (first == null)
+				first = cur;
+			if (cur.running)
+				return cur;
+		}
+		if (first != null)
+			return first;
+	}
+	return { running: false, pid: null };
+}
+
+function binaryInfo() {
+	let out = {
+		exists: exists(BIN),
+		size: fsize(BIN),
+		version: null,
+		error: null,
+		mtime: fmtime(BIN)
+	};
+	if (!out.exists)
+		return out;
+	let r = shell(`${BIN} -version 2>&1`);
+	if (r.rc == 0 && trim2(r.out) != '')
+		out.version = trim2(r.out);
+	else
+		out.error = trim2(r.out) || ('rc=' + r.rc);
+	return out;
+}
+
+function binaryVersionOf(path) {
+	let r = shell(`${sq(path)} -version 2>&1`);
+	let out = trim2(r.out);
+	if (r.rc != 0)
+		return { ok: false, version: null, error: out || ('rc=' + r.rc) };
+	return { ok: true, version: out, error: null };
+}
+
+function checkConfig(cp) {
+	let sp = secretsPath(cp), kp = secretsKeyPath(sp);
+	let res = {
+		path: cp,
+		exists: exists(cp),
+		size: fsize(cp),
+		mtime: fmtime(cp),
+		ok: false,
+		devices: null,
+		error: null,
+		output: '',
+		listen: '',
+		title: '',
+		tls: false,
+		panel: false,
+		legacy_secrets: false,
+		secrets_exists: exists(sp),
+		secrets_key_exists: exists(kp)
+	};
+	if (!res.exists) {
+		res.error = '配置文件不存在';
+		return res;
+	}
+	let text = '';
+	try { text = readfile(cp) ?? ''; } catch (e) { text = ''; }
+	if (fsize(cp) > 2 * 1024 * 1024) {
+		res.error = '配置文件过大';
+		return res;
+	}
+	let p = parseConfig(text);
+	res.listen = p.listen;
+	res.title = p.title;
+	res.tls = p.tls;
+	res.panel = p.panel;
+	res.legacy_secrets = hasLegacySecrets(text);
+
+	if (!exists(BIN)) {
+		res.error = '未安装二进制，无法校验配置';
+		return res;
+	}
+
+	let r = shell(`${BIN} -config ${sq(cp)} -secrets ${sq(sp)} -secrets-key ${sq(kp)} -check 2>&1`);
+	res.output = trim2(r.out);
+	if (r.rc == 0) {
+		res.ok = true;
+		let m = match(res.output, /\((\d+) devices?\)/);
+		res.devices = m ? +m[1] : 0;
+	}
+	else {
+		res.error = lastLine(res.output) || '配置校验失败';
+	}
+	return res;
+}
+
+function maskSensitive(line) {
+	line = replace(line, /"(password|passphrase|token|access_token|secret_key|auth_key|private_key|bemfa_secret_key|blinker_auth_key)"[ \t]*:[ \t]*"[^"]*"/g, '"***":"***"');
+	line = replace(line, /password=[^ \t\r\n]+/g, 'password=***');
+	line = replace(line, /passphrase=[^ \t\r\n]+/g, 'passphrase=***');
+	line = replace(line, /token=[^ \t\r\n]+/g, 'token=***');
+	line = replace(line, /access_token=[^ \t\r\n]+/g, 'access_token=***');
+	line = replace(line, /secret_key=[^ \t\r\n]+/g, 'secret_key=***');
+	line = replace(line, /auth_key=[^ \t\r\n]+/g, 'auth_key=***');
+	line = replace(line, /private_key=[^ \t\r\n]+/g, 'private_key=***');
+	return line;
+}
+
+function logLines(n) {
+	let r = shell(`tail -n ${n} ${sq(LOG_FILE)} 2>/dev/null`);
+	let txt = trim2(r.out);
+	if (txt != '') {
+		let raw = split(txt, '\n');
+		let out = [];
+		for (let i = 0; i < length(raw); i++)
+			if (trim2(raw[i]) != '')
+				push(out, raw[i]);
+		return out;
+	}
+	r = shell('logread -e wolservice 2>/dev/null');
+	txt = trim2(r.out);
+	if (txt == '')
+		return [];
+	return split(txt, '\n');
+}
+
+function sanitize(lines) {
+	let out = [];
+	for (let i = 0; i < length(lines); i++)
+		push(out, maskSensitive(lines[i]));
+	return out;
+}
+
+function sanitizeText(text) {
+	let lines = split(text ?? '', '\n');
+	let out = [];
+	for (let i = 0; i < length(lines); i++)
+		push(out, maskSensitive(lines[i]));
+	return join('\n', out);
+}
+
+/* 构建方式建议不是运行时故障，安全提示里会单独说明，不占“最近告警/错误” */
+function isBuildAdvisory(line) {
+	return match(line, /secrets master key is stored on disk/) != null;
+}
+
+function lastErrorOf(lines) {
+	for (let i = length(lines) - 1; i >= 0; i--) {
+		if (isBuildAdvisory(lines[i]))
+			continue;
+		if (match(lines[i], /level=(ERROR|WARN)/) != null)
+			return lines[i];
+	}
+	return null;
+}
+
+/* ---------------- 服务自带面板探测 ---------------- */
+
+function httpGet(url, insecure, timeout) {
+	let t = timeout ?? 3;
+	let opt = insecure ? ' -k' : '';
+	if (exists('/usr/bin/curl'))
+		return shell(`curl -fsS --max-time ${t}${opt} ${sq(url)} 2>&1`);
+	let uopt = insecure ? ' --no-check-certificate' : '';
+	return shell(`uclient-fetch -q -O - --timeout=${t}${uopt} ${sq(url)} 2>&1`);
+}
+
+function panelProbe(cc) {
+	let sl = splitListen(cc.listen);
+	if (sl == null)
+		return { ok: false, error: '无法解析 server.listen', url: null, info: null };
+	let host = (sl.host != '' && sl.host != '0.0.0.0' && sl.host != '::') ? sl.host : '127.0.0.1';
+	if (index(host, ':') >= 0 && substr(host, 0, 1) != '[')
+		host = `[${host}]`;
+	let scheme = cc.tls ? 'https' : 'http';
+	let url = `${scheme}://${host}:${sl.port}/api/info`;
+	let r = httpGet(url, cc.tls);
+	let info = null;
+	try { info = json(trim2(r.out)); } catch (e) { info = null; }
+	if (info == null)
+		return {
+			ok: false,
+			url: url,
+			info: null,
+			error: trim2(r.out) || ('请求失败 rc=' + r.rc)
+		};
+	return { ok: true, url: url, info: info, error: null };
+}
+
+/* ---------------- 服务动作 ---------------- */
+
+function doService(action) {
+	let c = conf();
+	let init = '/etc/init.d/wolservice';
+
+	if ((action == 'start' || action == 'restart') && !exists(BIN))
+		return fail('未安装 /usr/bin/wol，请先在页面中上传二进制');
+
+	if (action == 'start') {
+		setUciEnabled(true);
+		shell(`${init} enable 2>&1`);
+	}
+	else if (action == 'stop') {
+		setUciEnabled(false);
+		shell(`${init} disable 2>&1`);
+	}
+
+	let r = shell(`${init} ${action} 2>&1`);
+	let out = trim2(r.out);
+	let st = serviceState();
+
+	if (action == 'start' || action == 'restart') {
+		for (let i = 0; i < 6 && !st.running; i++) {
+			shell('sleep 1');
+			st = serviceState();
+		}
+	}
+	else if (action == 'stop') {
+		for (let i = 0; i < 3 && st.running; i++) {
+			shell('sleep 1');
+			st = serviceState();
+		}
+	}
+
+	let ok;
+	if (action == 'stop')
+		ok = !st.running;
+	else if (action == 'start' || action == 'restart')
+		ok = st.running;
+	else
+		ok = r.rc == 0;
+
+	let error = null;
+	if (!ok) {
+		let tail = sanitize(logLines(8));
+		if (out != '')
+			error = sanitizeText(out);
+		else if (action == 'start' || action == 'restart')
+			error = '服务未能启动，原因见日志：\n' + tail.join('\n');
+		else
+			error = '操作未生效（详见日志）';
+	}
+
+	return { ok: ok, action: action, output: sanitizeText(out), error: error, running: st.running, pid: st.pid };
+}
+
+/* ---------------- 二进制安装 ---------------- */
+
+function doInstall(src) {
+	let size = fsize(src);
+	if (size < MIN_BINARY)
+		return fail('文件过小（至少 1MB），不是有效的 WOL 二进制');
+	if (size > MAX_BINARY)
+		return fail('文件过大（上限 128MB）');
+
+	let magic = shell(`head -c 4 ${sq(src)} | hexdump -v -e '1/1 "%02x"'`);
+	if (trim2(magic.out) != '7f454c46') {
+		unlink(src);
+		return fail('不是 ELF 可执行文件');
+	}
+
+	let r = shell(`cp -f ${sq(src)} ${sq(NEW_BIN)} && chmod 0755 ${sq(NEW_BIN)}`);
+	if (r.rc != 0) {
+		unlink(src);
+		return fail('写入临时二进制失败');
+	}
+
+	let ver = binaryVersionOf(NEW_BIN);
+	if (!ver.ok) {
+		shell(`rm -f ${sq(NEW_BIN)}`);
+		unlink(src);
+		return fail('二进制无法在当前系统运行（架构不匹配或文件损坏）：' + ver.error);
+	}
+
+	if (exists(BIN))
+		shell(`cp -f ${sq(BIN)} ${sq(PREV)} && chmod 0755 ${sq(PREV)} 2>/dev/null`);
+
+	r = shell(`mv -f ${sq(NEW_BIN)} ${sq(BIN)} && chmod 0755 ${sq(BIN)}`);
+	if (r.rc != 0) {
+		unlink(src);
+		return fail('替换二进制失败');
+	}
+	unlink(src);
+
+	let wasRunning = serviceState().running;
+	if (wasRunning || conf().enabled) {
+		let rs = doService('restart');
+		if (!rs.ok) {
+			if (exists(PREV)) {
+				shell(`cp -f ${sq(PREV)} ${sq(BIN)} && chmod 0755 ${sq(BIN)}`);
+				doService('restart');
+				return {
+					ok: false,
+					error: '新二进制启动失败，已回滚到上一版本（若仍失败请查看日志，可能是配置问题）：' + (rs.error ?? ''),
+					version: ver.version,
+					rolled_back: true
+				};
+			}
+			return { ok: false, error: '新二进制启动失败：' + (rs.error ?? ''), version: ver.version };
+		}
+	}
+
+	return { ok: true, version: ver.version, size: size };
+}
+
+/* ---------------- 配置写入 ---------------- */
+
+/* 只修改顶层 section 下的一行布尔值；返回 null 表示该 section 不是块格式。 */
+function setYamlSectionBool(text, section, key, value) {
+	let normalized = replace(text ?? '', /\r\n/g, '\n');
+	let lines = split(normalized, '\n');
+	let sectionIdx = -1;
+	let keyIdx = -1;
+	let keyIndent = '';
+	let inSection = false;
+
+	for (let i = 0; i < length(lines); i++) {
+		let line = lines[i];
+		if (trim2(line) == '' || match(line, /^[ \t]*#/) != null)
+			continue;
+
+		let top = match(line, /^([A-Za-z_][A-Za-z0-9_]*):[ \t]*(.*)$/);
+		if (top != null) {
+			inSection = false;
+			if (top[1] == section) {
+				let tail = trim2(top[2]);
+				if (tail != '' && match(tail, /^#/) == null)
+					return null;
+				sectionIdx = i;
+				inSection = true;
+			}
+			continue;
+		}
+
+		if (!inSection)
+			continue;
+
+		let kv = match(line, /^([ \t]+)([A-Za-z_][A-Za-z0-9_]*)[ \t]*:[ \t]*(.*)$/);
+		if (kv != null && kv[2] == key) {
+			keyIdx = i;
+			keyIndent = kv[1];
+			break;
+		}
+	}
+
+	if (keyIdx >= 0) {
+		lines[keyIdx] = keyIndent + key + ': ' + value;
+		return join('\n', lines);
+	}
+
+	if (sectionIdx >= 0) {
+		let indent = '';
+		for (let j = sectionIdx + 1; j < length(lines); j++) {
+			if (trim2(lines[j]) == '' || match(lines[j], /^[ \t]*#/) != null)
+				continue;
+			let m = match(lines[j], /^([ \t]+)/);
+			if (m != null)
+				indent = m[1];
+			break;
+		}
+		if (indent == '')
+			indent = '  ';
+		let insert = indent + key + ': ' + value;
+		let before = slice(lines, 0, sectionIdx + 1);
+		let after = slice(lines, sectionIdx + 1);
+		if (length(after) == 0)
+			return join('\n', before) + '\n' + insert + '\n';
+		return join('\n', before) + '\n' + insert + '\n' + join('\n', after);
+	}
+
+	let base = normalized;
+	if (base != '' && substr(base, length(base) - 1, 1) != '\n')
+		base += '\n';
+	return base + '\n' + section + ':\n  ' + key + ': ' + value + '\n';
+}
+
+/* 校验并原子写入配置；被 YAML 编辑器和配置中心开关共用。 */
+function writeConfigChecked(cp, content, restart) {
+	let dir = dirOf(cp);
+	shell(`mkdir -p ${sq(dir)} 2>/dev/null && chmod 700 ${sq(dir)} 2>/dev/null`);
+
+	let tmp = cp + '.luci-new';
+	writefile(tmp, content);
+	chmod(tmp, 0o600);
+	if (fsize(tmp) <= 0) {
+		unlink(tmp);
+		return fail('写入临时配置失败');
+	}
+	if (fsize(tmp) > MAX_CONFIG) {
+		unlink(tmp);
+		return fail('配置内容超过 512KB');
+	}
+
+	let sp = secretsPath(cp), kp = secretsKeyPath(sp);
+	let r = shell(`${BIN} -config ${sq(tmp)} -secrets ${sq(sp)} -secrets-key ${sq(kp)} -check 2>&1`);
+	if (r.rc != 0) {
+		unlink(tmp);
+		return {
+			ok: false,
+			saved: false,
+			error: lastLine(trim2(r.out)) || '配置校验失败',
+			output: trim2(r.out)
+		};
+	}
+
+	let oldText = exists(cp) ? (readfile(cp) ?? '') : '';
+	let oldP = parseConfig(oldText);
+	let newP = parseConfig(content);
+	let needsRestart = oldP.listen != newP.listen || oldP.tls != newP.tls ||
+		oldP.read_timeout != newP.read_timeout || oldP.shutdown_timeout != newP.shutdown_timeout ||
+		oldP.log_level != newP.log_level || oldP.log_format != newP.log_format;
+
+	if (exists(cp))
+		shell(`cp -f ${sq(cp)} ${sq(cp + '.luci-bak')} 2>/dev/null && chmod 600 ${sq(cp + '.luci-bak')} 2>/dev/null`);
+
+	let mv = shell(`mv -f ${sq(tmp)} ${sq(cp)} 2>&1`);
+	if (mv.rc != 0) {
+		unlink(tmp);
+		return fail('写入配置失败：' + trim2(mv.out));
+	}
+	chmod(cp, 0o600);
+
+	let restarted = false, restartError = null;
+	if (restart && conf().enabled) {
+		let rr = doService('restart');
+		restarted = rr.ok;
+		if (!rr.ok)
+			restartError = rr.error;
+	}
+
+	return {
+		ok: restartError == null,
+		saved: true,
+		needs_restart: needsRestart && !restarted,
+		restarted: restarted,
+		error: restartError ?? (needsRestart && !restarted ? '监听/TLS/超时/日志级别等变更需要重启服务后才能生效' : null),
+		output: trim2(r.out)
+	};
+}
+
+function setPanelEnabled(cp, value) {
+	if (!exists(cp)) {
+		if (value)
+			return { ok: true, changed: false, saved: false, output: '' };
+		return fail('配置文件不存在，请先启动服务生成默认配置，再关闭配置中心');
+	}
+	let text = '';
+	try { text = readfile(cp) ?? ''; } catch (e) { return fail('读取配置文件失败：' + e); }
+	let updated = setYamlSectionBool(text, 'config_panel', 'enabled', value ? 'true' : 'false');
+	if (updated == null)
+		return fail('config_panel 使用了非块格式，无法自动修改；请用 YAML 编辑器修改');
+	if (updated == text)
+		return { ok: true, changed: false, saved: false, output: '' };
+
+	let r = writeConfigChecked(cp, updated, false);
+	if (r.ok === false)
+		return r;
+	r.changed = true;
+	return r;
+}
+
+/* ---------------- GitHub Release 更新 ---------------- */
+
+function deviceAssetName() {
+	let m = trim2(shell('uname -m').out);
+	let arch = '';
+	if (m == 'aarch64' || m == 'arm64')
+		arch = 'arm64';
+	else if (m == 'armv7l' || m == 'armv7' || m == 'armv6l' || m == 'arm')
+		arch = 'arm';
+	else if (m == 'x86_64' || m == 'amd64')
+		arch = 'amd64';
+	else if (m == 'mipsle')
+		arch = 'mipsle';
+	return { arch: m, asset: arch != '' ? `wol-linux-${arch}` : null };
+}
+
+function installedVersion() {
+	let bi = binaryInfo();
+	return bi.version;
+}
+
+function validVersion(v) {
+	return match(v ?? '', /^[0-9A-Za-z][0-9A-Za-z._-]{0,39}$/) != null;
+}
+
+function validDigest(d) {
+	return match(d ?? '', /^[0-9a-f]{64}$/) != null;
+}
+
+function validUpdateUrl(u) {
+	return match(u ?? '', /^https:\/\/github\.com\/inxen\/wolservice\/releases\/download\/[0-9A-Za-z._\/-]+$/) != null;
+}
+
+function verParts(v) {
+	let m = match(v ?? '', /^v?([0-9]+)\.([0-9]+)\.([0-9]+)/);
+	return m ? [ +m[1], +m[2], +m[3] ] : null;
+}
+
+function verGreater(a, b) {
+	let pa = verParts(a), pb = verParts(b);
+	if (!pa || !pb)
+		return null;
+	for (let i = 0; i < 3; i++)
+		if (pa[i] != pb[i])
+			return pa[i] > pb[i];
+	return false;
+}
+
+function jobState() {
+	let st = null;
+	if (exists(JOB_STATUS)) {
+		try { st = json(trim2(readfile(JOB_STATUS) ?? '')); } catch (e) { st = null; }
+	}
+	let phase = st ? (st.phase ?? 'idle') : 'idle';
+	let total = st ? +(st.total ?? 0) : 0;
+	let bytes = 0;
+	if (phase == 'downloading') {
+		let file = (st && type(st.file) == 'string' && match(st.file, /^\/tmp\/wolservice\.download\.[0-9A-Za-z.]+$/) != null) ? st.file : JOB_DOWNLOAD;
+		let b = fsize(file);
+		bytes = b > 0 ? b : 0;
+	}
+	else if (phase == 'verifying' || phase == 'installing' || phase == 'done') {
+		bytes = total;
+	}
+	return {
+		phase: phase,
+		message: st ? (st.message ?? '') : '',
+		total: total,
+		bytes: bytes
+	};
+}
+
+function jobActive() {
+	let j = jobState();
+	return j.phase == 'starting' || j.phase == 'downloading' ||
+		j.phase == 'verifying' || j.phase == 'installing';
+}
+
+/* ---------------- LuCI 配置表单 ---------------- */
+
+function globalDefaults(exists) {
+	return {
+		listen: '8090',
+		title: '网络唤醒',
+		tls_cert: '',
+		tls_key: '',
+		read_timeout: '15s',
+		shutdown_timeout: '15s',
+		config_panel_enabled: exists ? false : true,
+		auth_quick_panel: false,
+		auth_config_panel: true,
+		auth_trusted_enabled: false,
+		auth_trusted_networks: '',
+		log_level: 'info',
+		log_format: 'text',
+		probe_interval: '15s',
+		probe_timeout: '2s'
+	};
+}
+
+function stripYamlComment(value) {
+	let v = trim2(value);
+	if (v == '')
+		return '';
+	let q = substr(v, 0, 1);
+	if (q == '"' || q == "'") {
+		for (let i = 1; i < length(v); i++) {
+			let c = substr(v, i, 1);
+			if (q == '"' && c == '\\') {
+				i++;
+				continue;
+			}
+			if (c == q) {
+				if (q == "'" && substr(v, i + 1, 1) == "'") {
+					i++;
+					continue;
+				}
+				return substr(v, 0, i + 1);
+			}
+		}
+		return v;
+	}
+	let idx = index(v, ' #');
+	if (idx >= 0)
+		return trim2(substr(v, 0, idx));
+	return v;
+}
+
+function unquoteYaml(value) {
+	let v = trim2(value);
+	if (length(v) < 2)
+		return v;
+	let first = substr(v, 0, 1);
+	let last = substr(v, length(v) - 1, 1);
+	if (first == '"' && last == '"') {
+		let inner = substr(v, 1, length(v) - 2);
+		inner = replace(inner, /\\\\/g, '\\');
+		inner = replace(inner, /\\"/g, '"');
+		inner = replace(inner, /\\n/g, '\n');
+		return inner;
+	}
+	if (first == "'" && last == "'")
+		return replace(substr(v, 1, length(v) - 2), /''/g, "'");
+	return v;
+}
+
+function parseNetworkList(value) {
+	let v = trim2(value ?? '');
+	if (v == '')
+		return [];
+	let out = [];
+	if (match(v, /^\[.*\]$/) != null) {
+		v = trim2(substr(v, 1, length(v) - 2));
+		let parts = split(v, ',');
+		for (let i = 0; i < length(parts); i++) {
+			let item = trim2(unquoteYaml(parts[i]));
+			if (item != '')
+				push(out, item);
+		}
+		return out;
+	}
+	return [ unquoteYaml(v) ];
+}
+
+function yamlBool(value) {
+	return value == 'true' || value == 'yes' || value == '1';
+}
+
+function setGlobalValue(out, path, value) {
+	if (path == 'server.listen')
+		out.listen = value;
+	else if (path == 'server.title')
+		out.title = value;
+	else if (path == 'server.tls_cert')
+		out.tls_cert = value;
+	else if (path == 'server.tls_key')
+		out.tls_key = value;
+	else if (path == 'server.read_timeout' && value != '')
+		out.read_timeout = value;
+	else if (path == 'server.shutdown_timeout' && value != '')
+		out.shutdown_timeout = value;
+	else if (path == 'config_panel.enabled')
+		out.config_panel_enabled = yamlBool(value);
+	else if (path == 'auth.quick_panel')
+		out.auth_quick_panel = yamlBool(value);
+	else if (path == 'auth.config_panel')
+		out.auth_config_panel = yamlBool(value);
+	else if (path == 'auth.trusted_networks_enabled')
+		out.auth_trusted_enabled = yamlBool(value);
+	else if (path == 'log.level' && value != '')
+		out.log_level = value;
+	else if (path == 'log.format' && value != '')
+		out.log_format = value;
+	else if (path == 'probe.interval' && value != '')
+		out.probe_interval = value;
+	else if (path == 'probe.timeout' && value != '')
+		out.probe_timeout = value;
+}
+
+function parseGlobalConfig(text, exists) {
+	let out = globalDefaults(exists);
+	let lines = split(replace(text ?? '', /\r\n/g, '\n'), '\n');
+	let section = '';
+	let listNetworks = null;
+	let i = 0;
+	while (i < length(lines)) {
+		let line = lines[i];
+		if (trim2(line) == '' || match(line, /^[ \t]*#/) != null) {
+			i++;
+			continue;
+		}
+		let top = match(line, /^([A-Za-z_][A-Za-z0-9_]*):[ \t]*(.*)$/);
+		if (top != null) {
+			section = top[1];
+			listNetworks = null;
+			i++;
+			continue;
+		}
+		let item = match(line, /^[ \t]*-[ \t]*(.*)$/);
+		if (item != null) {
+			if (listNetworks != null) {
+				let v = trim2(unquoteYaml(stripYamlComment(item[1])));
+				if (v != '')
+					push(listNetworks, v);
+			}
+			i++;
+			continue;
+		}
+		let kv = match(line, /^([ \t]+)([A-Za-z_][A-Za-z0-9_]*)[ \t]*:[ \t]*(.*)$/);
+		if (kv == null) {
+			i++;
+			continue;
+		}
+		let key = kv[2];
+		let raw = stripYamlComment(kv[3]);
+		listNetworks = null;
+		if (section == 'auth' && key == 'trusted_networks') {
+			listNetworks = parseNetworkList(raw);
+			i++;
+			continue;
+		}
+		setGlobalValue(out, section + '.' + key, unquoteYaml(raw));
+		i++;
+	}
+	if (listNetworks != null)
+		out.auth_trusted_networks = join('\n', listNetworks);
+	return out;
+}
+
+function formString(value, def, maxLen) {
+	let s = value == null ? def : `${value}`;
+	s = trim2(s);
+	if (length(s) > maxLen || match(s, /[\r\n]/) != null)
+		return null;
+	return s;
+}
+
+function validDuration(value) {
+	return value != '' && length(value) <= 20 && match(value, /^[0-9][0-9A-Za-z.µ]*$/) != null;
+}
+
+function stripManagedSections(text, names) {
+	let lines = split(replace(text ?? '', /\r\n/g, '\n'), '\n');
+	let out = [];
+	let skip = false;
+	for (let i = 0; i < length(lines); i++) {
+		let line = lines[i];
+		let top = match(line, /^([A-Za-z_][A-Za-z0-9_]*):/);
+		if (top != null) {
+			skip = index(names, top[1]) >= 0;
+			if (!skip)
+				push(out, line);
+			continue;
+		}
+		if (!skip)
+			push(out, line);
+	}
+	return join('\n', out);
+}
+
+function buildGlobalConfig(text, f, exists) {
+	let port = +f.listen_port;
+	if (!(port >= 1 && port <= 65535))
+		return fail('监听端口必须是 1-65535');
+	let host = formString(f.listen_host, '', 100);
+	if (host == null)
+		return fail('绑定地址过长或包含换行');
+	if (host != '') {
+		if (match(host, /^[A-Za-z0-9._:\[\]-]+$/) == null)
+			return fail('绑定地址格式非法');
+		if (host == '0.0.0.0' || host == '::' || host == '[::]')
+			host = '';
+	}
+	let listen = `${port}`;
+	if (host != '') {
+		let h = replace(host, /^\[/, '');
+		h = replace(h, /\]$/, '');
+		listen = (index(h, ':') >= 0 ? '[' + h + ']' : h) + ':' + port;
+	}
+
+	let title = formString(f.title, '网络唤醒', 200);
+	if (title == null)
+		return fail('标题过长或包含换行');
+	if (title == '')
+		title = '网络唤醒';
+
+	let tlsCert = formString(f.tls_cert, '', 500);
+	let tlsKey = formString(f.tls_key, '', 500);
+	if (tlsCert == null || tlsKey == null)
+		return fail('TLS 证书/私钥路径过长或包含换行');
+	if ((tlsCert == '') != (tlsKey == ''))
+		return fail('TLS 证书和私钥必须同时填写或同时留空');
+
+	let readTimeout = formString(f.read_timeout, '15s', 20);
+	let shutdownTimeout = formString(f.shutdown_timeout, '15s', 20);
+	let probeInterval = formString(f.probe_interval, '15s', 20);
+	let probeTimeout = formString(f.probe_timeout, '2s', 20);
+	if (!validDuration(readTimeout))
+		return fail('读取超时格式无效（如 15s、500ms、1m30s）');
+	if (!validDuration(shutdownTimeout))
+		return fail('关闭超时格式无效（如 15s、500ms、1m30s）');
+	if (!validDuration(probeInterval))
+		return fail('探测间隔格式无效（如 15s、500ms、1m30s）');
+	if (!validDuration(probeTimeout))
+		return fail('探测超时格式无效（如 15s、500ms、1m30s）');
+
+	let level = `${f.log_level ?? 'info'}`;
+	let format = `${f.log_format ?? 'text'}`;
+	if (index([ 'debug', 'info', 'warn', 'error' ], level) < 0)
+		return fail('日志级别必须是 debug/info/warn/error');
+	if (index([ 'text', 'json' ], format) < 0)
+		return fail('日志格式必须是 text/json');
+
+	let networks = [];
+	let netLines = split(replace(`${f.auth_trusted_networks ?? ''}`, /\r\n/g, '\n'), '\n');
+	for (let i = 0; i < length(netLines); i++) {
+		let v = trim2(netLines[i]);
+		if (v == '' || substr(v, 0, 1) == '#')
+			continue;
+		if (match(v, /^[0-9A-Fa-f:.]+(\/[0-9]{1,3})?$/) == null)
+			return fail('可信网段格式无效：' + v);
+		push(networks, v);
+	}
+	if (truthy(f.auth_trusted_enabled) && length(networks) == 0)
+		return fail('启用可信网段时必须至少填写一个地址或 CIDR');
+
+	let q = function(s) { return sprintf('%J', s); };
+	let content = '';
+	content += 'server:\n';
+	content += '  listen: ' + q(listen) + '\n';
+	content += '  title: ' + q(title) + '\n';
+	content += '  tls_cert: ' + q(tlsCert) + '\n';
+	content += '  tls_key: ' + q(tlsKey) + '\n';
+	content += '  read_timeout: ' + q(readTimeout) + '\n';
+	content += '  shutdown_timeout: ' + q(shutdownTimeout) + '\n';
+	content += 'config_panel:\n';
+	content += '  enabled: ' + (truthy(f.config_panel_enabled) ? 'true' : 'false') + '\n';
+	content += 'log:\n';
+	content += '  level: ' + q(level) + '\n';
+	content += '  format: ' + q(format) + '\n';
+	content += 'probe:\n';
+	content += '  interval: ' + q(probeInterval) + '\n';
+	content += '  timeout: ' + q(probeTimeout) + '\n';
+	content += 'auth:\n';
+	content += '  quick_panel: ' + (truthy(f.auth_quick_panel) ? 'true' : 'false') + '\n';
+	content += '  config_panel: ' + (truthy(f.auth_config_panel) ? 'true' : 'false') + '\n';
+	content += '  trusted_networks_enabled: ' + (truthy(f.auth_trusted_enabled) ? 'true' : 'false') + '\n';
+	if (length(networks) == 0) {
+		content += '  trusted_networks: []\n';
+	}
+	else {
+		let items = [];
+		for (let i = 0; i < length(networks); i++)
+			push(items, q(networks[i]));
+		content += '  trusted_networks: [' + join(', ', items) + ']\n';
+	}
+
+	let rest = trim2(stripManagedSections(text, [ 'server', 'config_panel', 'log', 'probe', 'auth', 'relay' ]));
+	let final = (rest != '' ? rest + '\n\n' : '') + content;
+	return { ok: true, content: final };
+}
+
+/* ---------------- 方法实现 ---------------- */
+
+const methods = {
+
+	getStatus: {
+		call: function() {
+			let c = conf();
+			let st = serviceState();
+			let bi = binaryInfo();
+			let cc = checkConfig(c.config_path);
+			let lines = sanitize(logLines(30));
+			let probe = (st.running && cc.ok) ? panelProbe(cc) : null;
+			let panelCfg = null;
+			if (probe != null && probe.ok === true) {
+				let cfgUrl = replace(probe.url, /\/api\/info$/, '/api/config/status');
+				let cr = httpGet(cfgUrl, cc.tls);
+				try { panelCfg = json(trim2(cr.out)); } catch (e) { panelCfg = null; }
+			}
+			let sl = splitListen(cc.listen);
+			let listenHost = '';
+			if (sl != null && sl.host != '' && sl.host != '0.0.0.0' && sl.host != '::')
+				listenHost = sl.host;
+
+			return {
+				ok: true,
+				binary_exists: bi.exists,
+				binary_size: bi.size,
+				binary_version: bi.version,
+				binary_error: bi.error,
+				binary_mtime: bi.mtime,
+				running: st.running,
+				pid: st.pid,
+				enabled: c.enabled,
+				config_path: c.config_path,
+				config_exists: cc.exists,
+				config_size: cc.size,
+				config_mtime: cc.mtime,
+				config_ok: cc.ok,
+				config_error: cc.error,
+				config_devices: cc.devices,
+				config_legacy_secrets: cc.legacy_secrets,
+				secrets_exists: cc.secrets_exists,
+				secrets_key_exists: cc.secrets_key_exists,
+				listen: cc.listen,
+				listen_host: listenHost,
+				listen_port: sl ? sl.port : null,
+				tls: cc.tls,
+				title: cc.title,
+				panel_enabled: cc.panel,
+				panel_probe: probe,
+				config_panel_password_set: panelCfg ? (panelCfg.password_set === true) : null,
+				config_panel_api_enabled: panelCfg ? (panelCfg.enabled === true) : null,
+				key_source: probe && probe.info ? (probe.info.key_source ?? null) : null,
+				legacy_key_file: probe && probe.info ? probe.info.legacy_key_file === true : null,
+				auth_required: probe && probe.info ? probe.info.auth_required === true : null,
+				uptime_seconds: probe && probe.info ? probe.info.uptime_seconds : null,
+				log_tail: slice(lines, -20),
+				log_file_size: exists(LOG_FILE) ? fsize(LOG_FILE) : 0,
+				log_max_size: c.log_max_size,
+				last_error: lastErrorOf(lines),
+				can_rollback: exists(PREV),
+				rollback_version: exists(PREV) ? binaryVersionOf(PREV).version : null,
+				upload_pending: exists(TMP_UMETA),
+				system_arch: trim2(shell('uname -m').out)
+			};
+		}
+	},
+
+	getLog: {
+		args: { lines: 100 },
+		call: function(request) {
+			let n = +request.args.lines;
+			if (!(n >= 10 && n <= 500))
+				n = 100;
+			return { lines: sanitize(logLines(n)) };
+		}
+	},
+
+	getConfig: {
+		call: function() {
+			let c = conf();
+			if (!exists(c.config_path))
+				return {
+					exists: false,
+					path: c.config_path,
+					content: '',
+					size: 0,
+					mtime: null,
+					legacy_secrets: false,
+					max_size: MAX_CONFIG
+				};
+			if (fsize(c.config_path) > 2 * 1024 * 1024)
+				return fail('配置文件超过 2MB，请直接通过 SSH 处理');
+			let text = '';
+			try { text = readfile(c.config_path) ?? ''; } catch (e) { return fail('读取配置文件失败：' + e); }
+			return {
+				exists: true,
+				path: c.config_path,
+				content: text,
+				size: fsize(c.config_path),
+				mtime: fmtime(c.config_path),
+				legacy_secrets: hasLegacySecrets(text),
+				max_size: MAX_CONFIG
+			};
+		}
+	},
+
+	getConfigForm: {
+		call: function() {
+			let c = conf();
+			let ex = exists(c.config_path);
+			let text = '';
+			if (ex) {
+				try { text = readfile(c.config_path) ?? ''; } catch (e) { return fail('读取配置文件失败：' + e); }
+			}
+			let v = parseGlobalConfig(text, ex);
+			let sl = splitListen(v.listen);
+			v.listen_port = sl ? sl.port : 8090;
+			v.listen_host = sl ? sl.host : '';
+			v.listen_valid = sl != null;
+			let cc = checkConfig(c.config_path);
+			return {
+				ok: true,
+				exists: ex,
+				path: c.config_path,
+				values: v,
+				config_ok: cc.ok,
+				config_error: cc.error,
+				devices_count: cc.devices,
+				legacy_secrets: cc.legacy_secrets
+			};
+		}
+	},
+
+	saveConfigForm: {
+		args: { fields: '', restart: false },
+		call: function(request) {
+			let f = null;
+			try { f = json(`${request.args.fields ?? ''}`); } catch (e) { f = null; }
+			if (type(f) != 'object')
+				return fail('表单数据格式无效');
+			let c = conf();
+			let cp = c.config_path;
+			let ex = exists(cp);
+			let text = '';
+			if (ex) {
+				try { text = readfile(cp) ?? ''; } catch (e) { return fail('读取配置文件失败：' + e); }
+			}
+			if (hasLegacySecrets(text))
+				return fail('主配置含明文凭据；请先启动服务完成迁移，或使用服务自带 /config 保存');
+			let built = buildGlobalConfig(text, f, ex);
+			if (built.ok === false)
+				return built;
+			let r = writeConfigChecked(cp, built.content, truthy(request.args.restart));
+			if (r.ok === false)
+				return r;
+			r.form = true;
+			return r;
+		}
+	},
+
+	probePanel: {
+		call: function() {
+			let c = conf();
+			let cc = checkConfig(c.config_path);
+			if (!cc.exists)
+				return fail('配置文件不存在');
+			let st = serviceState();
+			if (!st.running)
+				return fail('服务未运行');
+			return panelProbe(cc);
+		}
+	},
+
+	checkUpdate: {
+		call: function() {
+			let ai = deviceAssetName();
+			let result = {
+				ok: false,
+				installed: installedVersion(),
+				latest: null,
+				has_update: null,
+				published: null,
+				size: null,
+				digest: null,
+				url: null,
+				asset: ai.asset,
+				arch: ai.arch,
+				error: null
+			};
+			if (!ai.asset) {
+				result.error = `当前架构 ${ai.arch} 没有预编译资产`;
+				return result;
+			}
+
+			let r = httpGet(GH_API, false, 20);
+			if (r.rc != 0 || trim2(r.out) == '') {
+				result.error = '获取 GitHub Release 失败：' + (trim2(r.out) || '网络请求失败（可能是 GitHub API 限流或网络受限）');
+				return result;
+			}
+			let rel = null;
+			try { rel = json(trim2(r.out)); } catch (e) { rel = null; }
+			if (rel == null) {
+				result.error = 'GitHub API 响应解析失败';
+				return result;
+			}
+			if (!rel.tag_name) {
+				result.error = rel.message ?? 'GitHub API 返回异常（可能触发频率限制）';
+				return result;
+			}
+			result.latest = rel.tag_name;
+			result.published = rel.published_at ?? null;
+
+			let asset = null;
+			if (rel.assets) {
+				for (let i = 0; i < length(rel.assets); i++)
+					if (rel.assets[i].name == ai.asset)
+						asset = rel.assets[i];
+			}
+			if (asset == null) {
+				result.error = `Release ${rel.tag_name} 未找到 ${ai.asset} 资产`;
+				return result;
+			}
+			result.size = asset.size ?? null;
+			result.url = asset.browser_download_url ?? null;
+			if (asset.digest != null && match(`${asset.digest}`, /^sha256:[0-9a-f]{64}$/))
+				result.digest = replace(`${asset.digest}`, /^sha256:/, '');
+			let cmp = result.installed ? verGreater(result.latest, result.installed) : true;
+			result.has_update = cmp === null ? true : cmp;
+			result.ok = true;
+			return result;
+		}
+	},
+
+	startInstall: {
+		args: { version: '', url: '', digest: '', size: 0, asset: '' },
+		call: function(request) {
+			let version = `${request.args.version ?? ''}`;
+			let url = `${request.args.url ?? ''}`;
+			let digest = `${request.args.digest ?? ''}`;
+			let size = +request.args.size;
+			let asset = `${request.args.asset ?? ''}`;
+			let ai = deviceAssetName();
+
+			if (!validVersion(version))
+				return fail('版本号格式非法');
+			if (!validUpdateUrl(url))
+				return fail('下载地址不在允许范围内（仅限 inxen/wolservice GitHub Release）');
+			if (!validDigest(digest))
+				return fail('缺少合法的 SHA256 摘要，拒绝安装未校验文件');
+			if (!(size >= MIN_BINARY && size <= MAX_BINARY))
+				return fail('文件大小超出允许范围');
+			if (!ai.asset || asset != ai.asset)
+				return fail('资产与当前架构不匹配');
+			if (jobActive())
+				return fail('已有更新任务正在进行');
+
+			writefile(JOB_STATUS, sprintf('{"phase":"starting","message":"准备安装 %s","total":%d}\n', version, size));
+			unlink(JOB_DOWNLOAD);
+			spawn(`setsid sh ${sq(JOB_SCRIPT)} ${sq(url)} ${sq(digest)} ${sq(size)} ${sq(version)} ${sq(asset)} </dev/null >/dev/null 2>&1 &`);
+			return { ok: true, version: version };
+		}
+	},
+
+	getJob: {
+		call: function() {
+			let j = jobState();
+			j.version = binaryInfo().version;
+			j.binary_exists = exists(BIN);
+			return j;
+		}
+	},
+
+	serviceAction: {
+		args: { action: '' },
+		call: function(request) {
+			let action = `${request.args.action ?? ''}`;
+			let allowed = [ 'start', 'stop', 'restart', 'apply', 'sync' ];
+			if (index(allowed, action) < 0)
+				return fail('不支持的操作');
+
+			if (action == 'apply') {
+				let c = conf();
+				let st = serviceState();
+				if (!c.enabled)
+					action = st.running ? 'stop' : null;
+				else
+					action = st.running ? 'restart' : 'start';
+			}
+			else if (action == 'sync') {
+				let c = conf();
+				let st = serviceState();
+				if (c.enabled && !st.running)
+					action = 'start';
+				else if (!c.enabled && st.running)
+					action = 'stop';
+				else
+					return { ok: true, action: 'noop', output: '', error: null, running: st.running, pid: st.pid };
+			}
+
+			if (action == null)
+				return { ok: true, action: 'noop', output: '', error: null };
+
+			if (action == 'restart' && !conf().enabled)
+				return fail('服务未启用，请先启用服务');
+
+			return doService(action);
+		}
+	},
+
+	applySettings: {
+		args: { enabled: false, config_path: '', log_max_size: 256, config_panel_enabled: '' },
+		call: function(request) {
+			let old = conf();
+			let en = truthy(request.args.enabled);
+			let cp = trim2(`${request.args.config_path ?? ''}`) || DEFAULT_CONFIG;
+			let lmax = clampLog(request.args.log_max_size);
+			let cpMode = `${request.args.config_panel_enabled ?? ''}`;
+
+			if (!validConfigPath(cp))
+				return fail('配置路径必须是绝对路径、不含 ..，并以 .yaml 或 .yml 结尾');
+
+			if (cpMode == '1' || cpMode == '0') {
+				let pr = setPanelEnabled(cp, cpMode == '1');
+				if (pr.ok === false)
+					return {
+						ok: false,
+						error: pr.error,
+						enabled: en,
+						config_path: cp,
+						log_max_size: lmax,
+						config_panel_enabled: cpMode == '1'
+					};
+			}
+
+			let u = cursor();
+			u.set(CONF, 'main', 'enabled', en ? '1' : '0');
+			u.set(CONF, 'main', 'config_path', cp);
+			u.set(CONF, 'main', 'log_max_size', `${lmax}`);
+			u.commit(CONF);
+			chmod(`/etc/config/${CONF}`, 0o600);
+
+			shell(`/etc/init.d/wolservice ${en ? 'enable' : 'disable'} 2>&1`);
+
+			let st = serviceState();
+			let action = 'noop';
+			if (en) {
+				if (!st.running)
+					action = 'start';
+				else if (old.config_path != cp)
+					action = 'restart';
+			}
+			else if (st.running) {
+				action = 'stop';
+			}
+
+			if (action != 'noop') {
+				let r = doService(action);
+				if (!r.ok)
+					return {
+						ok: false,
+						error: r.error,
+						action: action,
+						enabled: en,
+						config_path: cp,
+						log_max_size: lmax
+					};
+			}
+
+			let st2 = serviceState();
+			return {
+				ok: true,
+				action: action,
+				enabled: en,
+				running: st2.running,
+				pid: st2.pid,
+				config_path: cp,
+				log_max_size: lmax,
+				config_panel_enabled: cpMode == '' ? null : (cpMode == '1')
+			};
+		}
+	},
+
+	saveConfig: {
+		args: { content: '', restart: false },
+		call: function(request) {
+			let content = `${request.args.content ?? ''}`;
+			if (trim2(content) == '')
+				return fail('配置内容不能为空');
+			if (length(content) > MAX_CONFIG)
+				return fail('配置内容超过 512KB');
+			return writeConfigChecked(conf().config_path, content, truthy(request.args.restart));
+		}
+	},
+
+	installLocal: {
+		args: { path: '' },
+		call: function(request) {
+			let p = `${request.args.path ?? ''}`;
+			if (!validBinPath(p))
+				return fail('非法文件路径');
+			if (!exists(p))
+				return fail('文件不存在');
+			if (exists(TMP_UMETA))
+				return fail('已有上传任务正在进行');
+			if (jobActive())
+				return fail('已有更新任务正在进行');
+			return doInstall(p);
+		}
+	},
+
+	rollbackBinary: {
+		call: function() {
+			if (!exists(PREV))
+				return fail('没有可回滚的版本');
+			let ver = binaryVersionOf(PREV);
+			if (!ver.ok)
+				return fail('上一版本无法运行：' + ver.error);
+
+			let r = shell(`cp -f ${sq(PREV)} ${sq(NEW_BIN)} && chmod 0755 ${sq(NEW_BIN)}`);
+			if (r.rc != 0)
+				return fail('复制上一版本失败');
+			r = shell(`mv -f ${sq(NEW_BIN)} ${sq(BIN)} && chmod 0755 ${sq(BIN)}`);
+			if (r.rc != 0) {
+				shell(`rm -f ${sq(NEW_BIN)}`);
+				return fail('替换二进制失败');
+			}
+
+			if (serviceState().running || conf().enabled) {
+				let rs = doService('restart');
+				if (!rs.ok)
+					return { ok: false, error: '已恢复上一版本，但服务未能启动：' + (rs.error ?? ''), version: ver.version };
+			}
+			return { ok: true, version: ver.version };
+		}
+	},
+
+	uploadBegin: {
+		args: { size: 0 },
+		call: function(request) {
+			let size = +request.args.size;
+			if (!(size >= MIN_BINARY && size <= MAX_BINARY))
+				return fail('文件大小超出范围（1MB - 128MB）');
+			if (jobActive())
+				return fail('GitHub 更新任务正在进行，请等待完成后再上传');
+
+			/* 浏览器关闭等原因留下旧会话时，直接丢弃并从新的会话开始。 */
+			unlink(TMP_UPLOAD);
+			unlink(TMP_UMETA);
+			writefile(TMP_UPLOAD, '');
+			writefile(TMP_UMETA, sprintf('{"size":%d,"next":0}\n', size));
+			return { ok: true, total: size };
+		}
+	},
+
+	uploadChunk: {
+		args: { seq: 0, data: '' },
+		call: function(request) {
+			let meta = readJson(TMP_UMETA);
+			if (meta == null)
+				return fail('上传会话不存在，请重新选择文件');
+			let seq = +request.args.seq;
+			if (seq != meta.next)
+				return fail(`分块序号不连续（期望 ${meta.next}，收到 ${seq}）`);
+			let bin = b64dec(`${request.args.data ?? ''}`);
+			if (bin == null || length(bin) == 0)
+				return fail('无效的分块数据');
+
+			let fd = open(TMP_UPLOAD, 'a');
+			if (!fd)
+				return fail('无法写入上传缓存');
+			fd.write(bin);
+			fd.close();
+
+			meta.next = seq + 1;
+			writefile(TMP_UMETA, sprintf('{"size":%d,"next":%d}\n', meta.size, meta.next));
+
+			let written = fsize(TMP_UPLOAD);
+			if (written > meta.size) {
+				unlink(TMP_UPLOAD);
+				unlink(TMP_UMETA);
+				return fail('上传内容超出声明大小');
+			}
+			return { ok: true, written: written, total: meta.size, seq: seq };
+		}
+	},
+
+	uploadEnd: {
+		call: function() {
+			let meta = readJson(TMP_UMETA);
+			if (meta == null)
+				return fail('上传会话不存在');
+			let size = fsize(TMP_UPLOAD);
+			if (size != meta.size) {
+				unlink(TMP_UPLOAD);
+				unlink(TMP_UMETA);
+				return fail(`上传不完整（${size} / ${meta.size} 字节）`);
+			}
+			let r = doInstall(TMP_UPLOAD);
+			unlink(TMP_UMETA);
+			return r;
+		}
+	},
+
+	uploadAbort: {
+		call: function() {
+			unlink(TMP_UPLOAD);
+			unlink(TMP_UMETA);
+			return { ok: true };
+		}
+	}
+};
+
+function guard(fn) {
+	return function(request) {
+		try {
+			return fn(request);
+		}
+		catch (e) {
+			return { ok: false, error: `内部错误：${e}` };
+		}
+	};
+}
+
+for (let name in methods)
+	if (type(methods[name]?.call) == 'function')
+		methods[name].call = guard(methods[name].call);
+
+return { wolservice: methods };

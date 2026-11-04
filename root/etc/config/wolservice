@@ -1,0 +1,6 @@
+
+config wolservice 'main'
+	option enabled '0'
+	option config_path '/etc/wol/wol.yaml'
+	# 日志上限（KB），写入 /tmp/log/wolservice.log（tmpfs，不占闪存）
+	option log_max_size '256'

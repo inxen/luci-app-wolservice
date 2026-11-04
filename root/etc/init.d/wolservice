@@ -1,0 +1,78 @@
+#!/bin/sh /etc/rc.common
+# WOL 网络唤醒服务 procd 启动脚本
+# 配置路径与日志上限全部来自 UCI；YAML 由服务自身热重载。
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/wol
+CONF=wolservice
+LOG_DIR=/tmp/log
+LOG=$LOG_DIR/wolservice.log
+
+logmsg() {
+	mkdir -p "$LOG_DIR"
+	echo "$(date '+%Y/%m/%d %H:%M:%S') $*" >> "$LOG"
+}
+
+start_service() {
+	local enabled config_path log_max_size
+
+	config_load "$CONF"
+	config_get_bool enabled 'main' 'enabled' 0
+	config_get config_path 'main' 'config_path' '/etc/wol/wol.yaml'
+	config_get log_max_size 'main' 'log_max_size' '256'
+
+	[ "$enabled" = "1" ] || {
+		logmsg "服务未启用（uci $CONF.main.enabled=0），跳过启动"
+		return 0
+	}
+
+	case "$config_path" in
+		/*) ;;
+		*) config_path='/etc/wol/wol.yaml' ;;
+	esac
+	case "$config_path" in
+		*..*) config_path='/etc/wol/wol.yaml' ;;
+	esac
+	case "$log_max_size" in
+		''|*[!0-9]*) log_max_size=256 ;;
+	esac
+	[ "$log_max_size" -lt 32 ] && log_max_size=32
+	[ "$log_max_size" -gt 8192 ] && log_max_size=8192
+
+	CONFIG_DIR=$(dirname "$config_path")
+	mkdir -p "$CONFIG_DIR"
+	chmod 700 "$CONFIG_DIR" 2>/dev/null
+
+	[ -x "$PROG" ] || {
+		logmsg "未找到可执行文件 $PROG，请在 LuCI「WOL 网络唤醒」页面上传二进制"
+		return 1
+	}
+
+	procd_open_instance main
+	procd_set_param command /usr/libexec/wolservice/run.sh
+	procd_set_param env WOL_CONFIG="$config_path" WOL_LOG_MAX_KB="$log_max_size"
+	procd_set_param respawn 3600 5 5
+	procd_set_param file /etc/config/$CONF
+	procd_set_param stdout 0
+	procd_set_param stderr 0
+	procd_close_instance
+
+	procd_open_instance logd
+	procd_set_param command /bin/sh /usr/libexec/wolservice/logd.sh
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 0
+	procd_set_param stderr 0
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger "$CONF"
+}
+
+reload_service() {
+	stop
+	start
+}

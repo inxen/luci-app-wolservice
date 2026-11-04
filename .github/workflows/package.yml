@@ -1,0 +1,111 @@
+name: package
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的已存在标签，例如 v0.6.6"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  # 路由器实测环境是 ImmortalWrt 25.12.2（APK 打包）。
+  # 想给 OpenWrt 24.10 出 .ipk，把这两行换成
+  # SDK_INDEX: https://downloads.openwrt.org/releases
+  # FW_VERSION: "24.10.2"
+  SDK_INDEX: https://downloads.immortalwrt.org/releases
+  FW_VERSION: "25.12.2"
+  TARGET: x86/64
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gettext libncurses-dev \
+            libssl-dev python3 python3-setuptools rsync swatch unzip zlib1g-dev file zstd
+
+      - name: Fetch SDK
+        run: |
+          set -euo pipefail
+          url="${SDK_INDEX}/${FW_VERSION}/targets/${TARGET}/"
+          # 24.10 / 25.12 的 SDK 都是 .tar.zst，更早的发布是 .tar.xz，两种都认。
+          tarball=$(curl -sSL "$url" | grep -oE '[a-z]+-sdk-[^"<> ]+\.tar\.(zst|xz)' | head -1)
+          test -n "$tarball" || { echo "no SDK tarball under $url" >&2; exit 1; }
+          echo "downloading $tarball"
+          curl -sSL -o sdk.tar.zst "${url}${tarball}"
+          mkdir -p sdk
+          tar -xf sdk.tar.zst -C sdk --strip-components=1
+
+      - name: Build package
+        run: |
+          set -euo pipefail
+          mkdir -p sdk/package/luci-app-wolservice
+          cp -a Makefile README.md htdocs root scripts sdk/package/luci-app-wolservice/
+          # LICENSE / docs 只在独立仓库里有，monorepo 子目录里没有，缺了就跳过。
+          for extra in LICENSE docs; do
+            [ -e "$extra" ] && cp -a "$extra" sdk/package/luci-app-wolservice/ || true
+          done
+          cd sdk
+          ./scripts/feeds update -a
+          # 只装 luci feed：core 依赖（rpcd、libubus、lua/ucode…）SDK 自带索引里有，
+          # 整包安装 packages feed 会让 defconfig 刷出上千条 "dependency does not exist"。
+          ./scripts/feeds install -a -p luci
+          ./scripts/feeds install -p packages ca-bundle
+          make defconfig
+          grep -q '^CONFIG_PACKAGE_luci-app-wolservice=y' .config || {
+            echo 'CONFIG_PACKAGE_luci-app-wolservice=y' >> .config
+            make defconfig
+          }
+          make package/luci-app-wolservice/compile V=s 2>&1 | tee /tmp/build.log
+
+      # SDK 日志要登录才能下载，失败时把报错抄进 annotation，公开 API 就能读到。
+      - name: Report build errors
+        if: failure()
+        run: |
+          set +e
+          [ -s /tmp/build.log ] || exit 0
+          msg=$(grep -E "fatal error:|No such file|error:|Error [0-9]+" /tmp/build.log | tail -n 20 | tr '\n' ' ')
+          msg=${msg//%/%25}
+          msg=${msg//|/%7C}
+          echo "::error title=SDK 编译失败::${msg:0:1500}"
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find sdk/bin/packages -type f \( -name 'luci-app-wolservice*.apk' -o -name 'luci-app-wolservice*.ipk' \) -print \
+            | while read -r f; do cp "$f" out/; done
+          test -n "$(ls -A out)" || { echo "no package produced" >&2; exit 1; }
+          (cd out && sha256sum * > checksums.txt)
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-wolservice-${{ env.TAG }}
+          path: out/*
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" out/* --clobber
+          else
+            gh release create "${TAG}" out/* \
+              --title "${TAG}" \
+              --notes "luci-app-wolservice ${TAG}：OpenWrt/ImmortalWrt SDK 构建的 LuCI 包（${{ env.FW_VERSION }} / ${{ env.TARGET }}）。包内不含 WOL 二进制，二进制请在面板上传或安装主项目 Release 资产。"
+          fi

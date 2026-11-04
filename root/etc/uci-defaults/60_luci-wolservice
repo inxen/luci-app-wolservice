@@ -1,0 +1,6 @@
+#!/bin/sh
+# 配置目录只允许 root 进入；主配置不含凭据，凭据在加密 secrets 文件中。
+[ -f /etc/config/wolservice ] && chmod 600 /etc/config/wolservice
+mkdir -p /etc/wol 2>/dev/null
+chmod 700 /etc/wol 2>/dev/null
+exit 0

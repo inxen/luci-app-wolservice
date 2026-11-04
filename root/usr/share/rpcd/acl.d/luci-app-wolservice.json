@@ -1,0 +1,41 @@
+{
+	"luci-app-wolservice": {
+		"description": "WOL 网络唤醒服务控制器",
+		"read": {
+			"ubus": {
+				"wolservice": [
+					"getStatus",
+					"getLog",
+					"getConfig",
+					"getConfigForm",
+					"probePanel",
+					"checkUpdate",
+					"getJob"
+				]
+			},
+			"uci": [
+				"wolservice"
+			]
+		},
+		"write": {
+			"ubus": {
+				"wolservice": [
+					"serviceAction",
+					"applySettings",
+					"saveConfig",
+					"saveConfigForm",
+					"startInstall",
+					"installLocal",
+					"rollbackBinary",
+					"uploadBegin",
+					"uploadChunk",
+					"uploadEnd",
+					"uploadAbort"
+				]
+			},
+			"uci": [
+				"wolservice"
+			]
+		}
+	}
+}
